@@ -45,7 +45,14 @@ if(WIN32)
     if(NOT DEFINED GGML_OPENMP OR GGML_OPENMP)
         set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
     endif()
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
     include(InstallRequiredSystemLibraries)
+    # The ARM64 runtime's vcruntime140_1.dll is x64 code (for emulated and ARM64EC
+    # processes); ARM64 binaries do not import it.
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+        list(FILTER CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS EXCLUDE REGEX "/vcruntime[0-9]+_1\\.dll$")
+    endif()
+    install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 set(NEMO_SPEECH_LICENSE_INSTALL_DIR
     "${CMAKE_INSTALL_DATADIR}/licenses/nemo-speech")
@@ -123,6 +130,7 @@ option(NEMO_SPEECH_BUILD_DIAR      "Build standalone and ASR-integrated diarizat
 option(NEMO_SPEECH_BUILD_TTS       "Build text-to-speech" ON)
 option(NEMO_SPEECH_BUILD_NMT       "Build text translation (links llama.cpp)" ${NEMO_SPEECH_WITH_NMT})
 option(NEMO_SPEECH_BUILD_S2S       "Build full-duplex Nemotron voicechat" OFF)
+option(NEMO_SPEECH_BUILD_SPEECHLM  "Build speech-LLM transcription (speech encoder + llama.cpp decoder)" OFF)
 option(NEMO_SPEECH_BUILD_CLI       "Build the unified nemo-speech CLI" ON)
 option(NEMO_SPEECH_BUILD_MIC_CAPTURE "Build microphone capture in the CLI and examples" ON)
 option(NEMO_SPEECH_BUILD_HTTP      "Build the HTTP server and local playground" OFF)
@@ -248,6 +256,13 @@ if(GGML_CUDA)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
+
+# nvcc's host compiler on Windows is always cl.exe, and CCCL 3.2+ (CUDA 13) rejects its traditional
+# preprocessor (https://github.com/NVIDIA/cccl/pull/6827). ggml-cuda sets this for its own sources;
+# cover the in-tree CUDA targets created below (cuBLAS shim, MagpieTTS kernels).
+if(GGML_CUDA AND WIN32)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 if(GGML_VULKAN)
     install(TARGETS ggml-vulkan
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -330,16 +345,24 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra>")
 endif()
 
-# llama.cpp for the NMT decoder. It reuses the ggml target added above (its
-# CMake builds its own ggml only when the target is absent), so one ggml backend
-# is shared across asr/tts/nmt. Build only libllama.
-if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S)
-    set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
+# llama.cpp for the NMT, S2S and speech-LLM decoders. It reuses the ggml target added
+# above (its CMake builds its own ggml only when the target is absent), so one
+# ggml backend is shared across asr/tts/nmt/s2s/speechlm. Build only libllama.
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S OR NEMO_SPEECH_BUILD_SPEECHLM)
+    # The speech-LLM engine uses llama.cpp's common speculative-decoding driver (MTP).
+    if(NEMO_SPEECH_BUILD_SPEECHLM)
+        set(LLAMA_BUILD_COMMON ON  CACHE BOOL "" FORCE)
+    else()
+        set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+    endif()
     set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
     set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
+    # llama-common's vendored cpp-httplib would otherwise link a host OpenSSL (Homebrew's on the
+    # macOS runners), which the release archives cannot carry. MTP never downloads anything.
+    set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
     add_subdirectory("${NEMO_SPEECH_LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
     set_property(TARGET llama PROPERTY PUBLIC_HEADER "")
     install(TARGETS llama
@@ -378,6 +401,12 @@ if(NEMO_SPEECH_BUILD_NMT)
     if(NEMO_SPEECH_BUILD_ASR)
         add_subdirectory(src/speech)
     endif()
+endif()
+if(NEMO_SPEECH_BUILD_SPEECHLM)
+    if(NOT NEMO_SPEECH_BUILD_ASR)
+        message(FATAL_ERROR "NEMO_SPEECH_BUILD_SPEECHLM requires NEMO_SPEECH_BUILD_ASR (speech encoder)")
+    endif()
+    add_subdirectory(src/speechlm)
 endif()
 if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR OR
    NEMO_SPEECH_BUILD_TTS OR NEMO_SPEECH_BUILD_NMT OR
@@ -438,10 +467,9 @@ if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
 endif()
 install(FILES llama.cpp/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
-if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_CLI AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
-    install(FILES third_party/miniaudio/LICENSE
-        DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
-endif()
+# miniaudio (dr_flac / dr_mp3) is compiled into every build (audio_ingest).
+install(FILES third_party/miniaudio/LICENSE
+    DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
 if(TARGET nemo_speech_cublas_shim)
     install(TARGETS nemo_speech_cublas_shim
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -451,7 +479,7 @@ if(NEMO_SPEECH_BUILD_HTTP)
     install(FILES third_party/cpp-httplib/LICENSE
         DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/cpp-httplib")
 endif()
-if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S)
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S OR NEMO_SPEECH_BUILD_SPEECHLM)
     install(FILES llama.cpp/LICENSE
         DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/llama.cpp")
 endif()

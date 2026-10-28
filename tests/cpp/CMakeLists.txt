@@ -20,11 +20,50 @@ add_executable(test_subtitles
 target_link_libraries(test_subtitles PRIVATE nemo_speech_common)
 add_test(NAME subtitles COMMAND test_subtitles)
 
+add_executable(test_audio_ingest
+    ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_audio_ingest.cpp)
+target_link_libraries(test_audio_ingest PRIVATE nemo_speech_common)
+add_test(NAME audio_ingest COMMAND test_audio_ingest)
+
 if(TARGET nemo_speech_http_server)
     add_executable(test_http_server_config
         ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_http_server_config.cpp)
     target_link_libraries(test_http_server_config PRIVATE nemo_speech_http_server)
     add_test(NAME http_server_config COMMAND test_http_server_config)
+    if(NEMO_SPEECH_BUILD_ASR)
+        add_executable(test_chat_api ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_chat_api.cpp)
+        target_link_libraries(test_chat_api PRIVATE nemo_speech_http_server)
+        add_test(NAME chat_api COMMAND test_chat_api)
+    endif()
+
+    add_executable(test_http_errors ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_http_errors.cpp)
+    target_link_libraries(test_http_errors PRIVATE nemo_speech_http_server)
+    add_test(NAME http_errors COMMAND test_http_errors)
+endif()
+
+# Riva Recognize over a fake complete-audio backend (status mapping, SALM transcript policy).
+if(TARGET nemo_speech_grpc_asr)
+    add_executable(test_grpc_asr_offline
+        ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_grpc_asr_offline.cpp)
+    target_link_libraries(test_grpc_asr_offline PRIVATE nemo_speech_grpc_asr)
+    add_test(NAME grpc_asr_offline COMMAND test_grpc_asr_offline)
+endif()
+
+# Riva speech-to-text translation by a fake speech-LLM backend, without an NMT model.
+if(TARGET nemo_speech_grpc_nmt)
+    add_executable(test_grpc_nmt_speech_llm
+        ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_grpc_nmt_speech_llm.cpp)
+    target_link_libraries(test_grpc_nmt_speech_llm PRIVATE nemo_speech_grpc_nmt)
+    add_test(NAME grpc_nmt_speech_llm COMMAND test_grpc_nmt_speech_llm)
+endif()
+
+# Speech translation over a fake complete-audio backend; an NMT GGUF argument adds an
+# end-to-end check.
+if(TARGET nemo_speech_speech)
+    add_executable(test_offline_speech_translation
+        ${CMAKE_SOURCE_DIR}/tests/cpp/speech/test_offline_speech_translation.cpp)
+    target_link_libraries(test_offline_speech_translation PRIVATE nemo_speech_speech)
+    add_test(NAME offline_speech_translation COMMAND test_offline_speech_translation)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -127,6 +166,9 @@ if(NEMO_SPEECH_BUILD_TTS)
 endif()
 if(NEMO_SPEECH_BUILD_NMT)
     add_subdirectory(nmt)
+endif()
+if(NEMO_SPEECH_BUILD_SPEECHLM)
+    add_subdirectory(speechlm)
 endif()
 
 if(TARGET nemo_speech_cublas_shim)

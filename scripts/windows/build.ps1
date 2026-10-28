@@ -20,8 +20,8 @@
     config), so use a distinct -BuildDir for each.
 
 .PARAMETER Profile
-    Component preset: core, asr, server (core + NMT + HTTP), full, or developer
-    (full + tests, examples, and tools). Component switches add features.
+    Component preset: core, asr, server (core + NMT + speech-LLM + HTTP), full, or
+    developer (full + tests, examples, and tools). Component switches add features.
 
 .PARAMETER Grpc
     Also build the Riva-compatible riva_server. gRPC and protobuf are installed
@@ -31,6 +31,10 @@
     Also build the NMT translation component (links llama.cpp; checks out the
     llama.cpp submodule if needed). Combine with -Grpc for the gRPC TranslateText
     service. Convert the model separately - see docs/development/windows-build.md.
+
+.PARAMETER Speechlm
+    Also build speech-LLM transcription (SALM: speech encoder and
+    llama.cpp decoder; checks out the llama.cpp submodule if needed). Requires ASR.
 
 .PARAMETER Flashlight
     Build LM-fused CTC decoding with Flashlight and dynamically linked KenLM
@@ -42,6 +46,10 @@
 .PARAMETER VcpkgRoot
     Existing vcpkg checkout to use. By default the driver bootstraps its pinned
     version under %LOCALAPPDATA%\NeMoSpeech.
+
+.PARAMETER VsVersion
+    vswhere version range of the Visual Studio to build with when several are
+    installed, for example '[17.0,18.0)' for 2022 (default: the newest).
 
 .PARAMETER TtsJa
     Build the optional Japanese TTS tokenizer (Open JTalk, MeCab, and the NAIST
@@ -76,7 +84,11 @@
     cl.exe as its CUDA host compiler regardless of this setting.
 
 .PARAMETER Architecture
-    Target architecture: auto (the host), x64, or arm64.
+    Target architecture: auto (the host), x64, or arm64. CUDA builds can
+    cross-compile from an x64 host to arm64 (Windows on Arm): this needs a CUDA
+    Toolkit with Windows ARM64 target libraries (13.4 or newer, lib\arm64), the
+    Visual Studio ARM64 C++ tools, clang-cl, and an explicit -CudaArch.
+
 .PARAMETER CMakeArgs
     Extra arguments appended to the CMake configure command, for example
     -CMakeArgs '-DGGML_NATIVE=OFF'.
@@ -85,6 +97,7 @@
     pwsh scripts\windows\build.ps1 -Backend cuda -Profile server
     pwsh scripts\windows\build.ps1 -Backend cpu -Profile full
     pwsh scripts\windows\build.ps1 -Backend vulkan -Profile developer
+    pwsh scripts\windows\build.ps1 -Backend cuda -Profile server -Architecture arm64 -CudaArch 121a-real
 #>
 [CmdletBinding()]
 param(
@@ -94,6 +107,7 @@ param(
     [string]$Profile = 'core',
     [switch]$Grpc,
     [switch]$Nmt,
+    [switch]$Speechlm,
     [switch]$Flashlight,
     [switch]$TtsJa,
     [switch]$TtsZh,
@@ -108,6 +122,7 @@ param(
     [switch]$CublasShim,
     [string]$VcpkgRoot,
     [string]$VcpkgTriplet,
+    [string]$VsVersion,
     [ValidateSet('auto', 'x64', 'arm64')]
     [string]$Architecture = 'auto',
     # C/C++ compiler. 'auto' = cl on x64, clang-cl on ARM64 (ggml's ARM CPU
@@ -134,6 +149,7 @@ $BuildAsr = $false
 $BuildDiar = $false
 $BuildTts = $false
 $BuildNmt = $false
+$BuildSpeechlm = $false
 $BuildHttp = $false
 $BuildGrpc = $false
 $BuildFlashlight = $false
@@ -148,16 +164,16 @@ switch ($Profile) {
     'asr'       { $BuildAsr = $true; $BuildDiar = $true }
     'server'    {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true
-        $BuildNmt = $true; $BuildHttp = $true
+        $BuildNmt = $true; $BuildSpeechlm = $true; $BuildHttp = $true
     }
     'full'      {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildNmt = $true
-        $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
+        $BuildSpeechlm = $true; $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
         $BuildTtsJa = $true; $BuildTtsZh = $true
     }
     'developer' {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildNmt = $true
-        $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
+        $BuildSpeechlm = $true; $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
         $BuildTtsJa = $true; $BuildTtsZh = $true
         $BuildTests = $true; $BuildExamples = $true; $BuildTools = $true
     }
@@ -165,6 +181,7 @@ switch ($Profile) {
 
 $BuildGrpc = $BuildGrpc -or $Grpc.IsPresent
 $BuildNmt = $BuildNmt -or $Nmt.IsPresent
+$BuildSpeechlm = $BuildSpeechlm -or $Speechlm.IsPresent
 $BuildFlashlight = $BuildFlashlight -or $Flashlight.IsPresent
 $BuildTtsJa = $BuildTtsJa -or $TtsJa.IsPresent
 $BuildTtsZh = $BuildTtsZh -or $TtsZh.IsPresent
@@ -173,6 +190,9 @@ $BuildHttpTls = $HttpTls.IsPresent
 $BuildTests = $BuildTests -or $Tests.IsPresent
 if ($BuildGrpc -and (-not $BuildAsr -or -not $BuildTts)) {
     throw 'The gRPC server currently requires both ASR and TTS. Use -Profile server, full, or developer.'
+}
+if ($BuildSpeechlm -and -not $BuildAsr) {
+    throw 'Speech-LLM transcription requires ASR. Use -Profile asr, server, full, or developer.'
 }
 if ($BuildFlashlight -and -not $BuildAsr) {
     throw 'The Flashlight decoder requires ASR. Use -Profile asr, server, full, or developer.'
@@ -201,7 +221,13 @@ if ($TargetArch -eq 'arm64' -and $Compiler -eq 'msvc') {
 }
 $CrossCompiling = ($HostArch -eq 'ARM64') -ne ($TargetArch -eq 'arm64')
 if ($Backend -eq 'cuda' -and $CrossCompiling) {
-    throw 'CUDA cross-compilation is not supported by this driver; build CUDA natively on the target architecture.'
+    # The x64 CUDA Toolkit ships Windows ARM64 target libraries; no toolkit targets x64 from an ARM64 host.
+    if ($TargetArch -ne 'arm64') {
+        throw 'CUDA cross-compilation is supported only from an x64 host to arm64; build x64 CUDA on an x64 host.'
+    }
+    if ($CudaArch -eq 'native') {
+        throw 'CUDA cross-compilation needs an explicit -CudaArch (for example 121a-real for RTX Spark); native would detect the build host GPU.'
+    }
 }
 if ($CublasShim -and $Backend -ne 'cuda') {
     throw '-CublasShim requires -Backend cuda.'
@@ -221,7 +247,7 @@ if ($BuildHttpTls) { $VcpkgFeatures.Add('http-tls') }
 if ($BuildExamples) { $VcpkgFeatures.Add('examples') }
 
 Write-Host "==> nemo-speech Windows build" -ForegroundColor Cyan
-Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
+Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt speechlm=$BuildSpeechlm http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
 Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetArch build=$BuildDir jobs=$Jobs cublas-shim=$($CublasShim.IsPresent)"
 Write-Host "    vcpkg=$($VcpkgFeatures -join ',') triplet=$VcpkgTriplet"
 if ($DryRun) { return }
@@ -242,8 +268,11 @@ $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.e
 if (-not (Test-Path $vswhere)) { throw "vswhere not found; install VS 2022 Build Tools (VC++ workload)." }
 $vcToolset = if ($TargetArch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
              else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
-$vsPath = & $vswhere -latest -products * -requires $vcToolset -property installationPath
+$vsVersionRange = if ($VsVersion) { @('-version', $VsVersion) } else { @() }
+$vsPath = & $vswhere -latest -products * @vsVersionRange -requires $vcToolset -property installationPath
 if (-not $vsPath) { throw "No VS install with the C++ toolset for $TargetArch found." }
+# vcpkg picks the newest Visual Studio on its own; its libraries must come from the same STL.
+if ($VsVersion) { $env:VCPKG_VISUAL_STUDIO_PATH = $vsPath }
 $vcvarsBat = if ($HostArch -eq 'ARM64' -and $TargetArch -eq 'x64') {
     'vcvarsarm64_x64.bat'
 } elseif ($HostArch -ne 'ARM64' -and $TargetArch -eq 'arm64') {
@@ -267,8 +296,15 @@ if ($Compiler -eq 'clang-cl' -and -not (Get-Command clang-cl -ErrorAction Silent
     throw "clang-cl not on PATH; install LLVM (choco install llvm) or the VS 'C++ Clang tools' component."
 }
 if ($Backend -eq 'cuda') {
-    if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
+    $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+    if (-not $nvcc) {
         throw 'nvcc not found; install a supported NVIDIA CUDA Toolkit.'
+    }
+    if ($CrossCompiling) {
+        $cudaRoot = Split-Path -Parent (Split-Path -Parent $nvcc.Source)
+        if (-not (Test-Path (Join-Path $cudaRoot 'lib\arm64\cudart.lib'))) {
+            throw "The CUDA Toolkit at $cudaRoot has no Windows ARM64 target libraries (lib\arm64); cross-compiling for arm64 needs CUDA 13.4 or newer."
+        }
     }
     if ($CudaArch -eq 'native') {
         $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
@@ -387,6 +423,7 @@ $configureArgs = @(
     "-DNEMO_SPEECH_BUILD_DIAR=$(ConvertTo-CMakeBool $BuildDiar)",
     "-DNEMO_SPEECH_BUILD_TTS=$(ConvertTo-CMakeBool $BuildTts)",
     "-DNEMO_SPEECH_BUILD_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
+    "-DNEMO_SPEECH_BUILD_SPEECHLM=$(ConvertTo-CMakeBool $BuildSpeechlm)",
     "-DNEMO_SPEECH_BUILD_HTTP=$(ConvertTo-CMakeBool $BuildHttp)",
     "-DNEMO_SPEECH_HTTP_TLS=$(ConvertTo-CMakeBool $BuildHttpTls)",
     "-DNEMO_SPEECH_BUILD_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
@@ -417,9 +454,15 @@ if ($Compiler -eq 'clang-cl') {
     }
     if ($Backend -eq 'cuda') {
         # nvcc only supports cl.exe as its host compiler on Windows; pin it
-        # explicitly so it never inherits clang-cl.
-        $configureArgs += '-DCMAKE_CUDA_HOST_COMPILER=cl'
+        # explicitly so it never inherits clang-cl. The imported environment's
+        # cl.exe targets $TargetArch (Hostx64\arm64 when cross-compiling).
+        $configureArgs += "-DCMAKE_CUDA_HOST_COMPILER=$((Get-Command cl).Source)"
     }
+}
+if ($Backend -eq 'cuda' -and $CrossCompiling) {
+    # Without --use-local-env nvcc runs vcvars for its own host and compiles
+    # x64 host code. A -DCMAKE_CUDA_FLAGS in -CMakeArgs must keep this flag.
+    $configureArgs += '-DCMAKE_CUDA_FLAGS=--use-local-env'
 }
 if ($TargetArch -eq 'arm64') {
     # Avoid an additional OpenMP runtime DLL in ARM64 packages.

@@ -17,8 +17,12 @@
     Release version, or nightly. Defaults to the one in VERSION.
 .PARAMETER OutputDir
     Destination for the archive and checksum (default: release-artifacts).
+.PARAMETER Architecture
+    Architecture the build targets: auto (the host), x64, or arm64. Set it for a
+    cross-compiled build; every packaged binary must match it.
 .EXAMPLE
     pwsh scripts\windows\package-release.ps1 -BuildDir build\release-cuda -Backend cuda
+    pwsh scripts\windows\package-release.ps1 -BuildDir build\release-cuda-arm64 -Backend cuda -Architecture arm64
 #>
 [CmdletBinding()]
 param(
@@ -28,24 +32,30 @@ param(
     [ValidateSet('cpu', 'vulkan', 'cuda')]
     [string]$Backend,
     [string]$Version,
-    [string]$OutputDir
+    [string]$OutputDir,
+    [ValidateSet('auto', 'x64', 'arm64')]
+    [string]$Architecture = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'release-artifacts' }
 if (-not $Version) {
-    $Version = ((Get-Content (Join-Path $RepoRoot 'VERSION')) -match '^NEMO_SPEECH_VERSION:' |
+    # @() keeps -match filtering lines: on a single-line file it would return a bool.
+    $Version = (@(Get-Content (Join-Path $RepoRoot 'VERSION')) -match '^NEMO_SPEECH_VERSION:' |
         Select-Object -First 1) -replace '^NEMO_SPEECH_VERSION:\s*', ''
 }
 if ($Version -ne 'nightly' -and $Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$') {
     throw "invalid release version '$Version'"
 }
-$arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
-    'X64' { 'x86_64' }
-    'Arm64' { 'aarch64' }
-    default { throw "unsupported architecture: $_" }
+if ($Architecture -eq 'auto') {
+    $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+        'X64' { 'x64' }
+        'Arm64' { 'arm64' }
+        default { throw "unsupported architecture: $_" }
+    }
 }
+$arch = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
 
 $name = "nemo-speech-$Version-windows-$arch-$Backend"
 $staging = Join-Path ([System.IO.Path]::GetTempPath()) "nemo-speech-package-$PID"
@@ -63,10 +73,27 @@ try {
     if (Get-ChildItem -Recurse $root -Include 'riva_server.exe', 'grpc*.dll') {
         throw 'release contains Riva gRPC payload'
     }
+    # A -CublasShim build installs its cublas64_*.dll; otherwise the package carries
+    # NVIDIA's cuBLAS and cuBLASLt for the target architecture, and the CUDA EULA.
+    $cublasShim = $false
     if ($Backend -eq 'cuda') {
         if (-not (Get-ChildItem $bin -Filter 'ggml-cuda.dll')) { throw 'CUDA package is missing ggml-cuda.dll' }
-        if (-not (Get-ChildItem $bin -Filter 'cublas64_*.dll')) {
-            throw 'CUDA package is missing the cuBLAS shim; build with -CublasShim'
+        $cublasShim = [bool](Get-ChildItem $bin -Filter 'cublas64_*.dll')
+        if (-not $cublasShim) {
+            $cache = Get-Content (Join-Path $BuildDir 'CMakeCache.txt')
+            $toolkitBin = ($cache | Where-Object { $_ -match '^CUDAToolkit_BIN_DIR:PATH=(.+)$' } |
+                ForEach-Object { $Matches[1] } | Select-Object -First 1)
+            if (-not $toolkitBin) { throw 'CUDAToolkit_BIN_DIR is not in the build cache' }
+            $toolkit = Split-Path -Parent $toolkitBin
+            $cublasDir = @("$toolkit\bin\$Architecture", "$toolkit\bin") |
+                Where-Object { Get-ChildItem $_ -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue } |
+                Select-Object -First 1
+            if (-not $cublasDir) { throw "no cuBLAS DLLs for $Architecture under $toolkit\bin" }
+            Copy-Item (Join-Path $cublasDir 'cublas64_*.dll'), (Join-Path $cublasDir 'cublasLt64_*.dll') $bin
+            $eula = Join-Path $root 'share\licenses\nemo-speech\nvidia\cuda-runtime'
+            New-Item -ItemType Directory -Force -Path $eula | Out-Null
+            Copy-Item (Join-Path $toolkit 'EULA.txt') $eula
+            Write-Host "Bundled cuBLAS and cuBLASLt from $cublasDir"
         }
     }
 
@@ -101,9 +128,21 @@ try {
         throw "the package is not self-contained:`n  $($missing -join "`n  ")"
     }
 
+    # A cross-compiled package must not mix in host binaries. The ARM64 Visual C++
+    # runtime's DLLs are ARM64X, which report AA64 (vcruntime140_1.dll, which reports
+    # x64, is for x64 code and is not installed).
+    $machine = if ($Architecture -eq 'arm64') { '^\s*AA64 machine' } else { '^\s*8664 machine \(x64\)\s*$' }
+    $wrongMachine = foreach ($file in Get-ChildItem $bin -Include '*.dll', '*.exe' -Recurse) {
+        $header = Invoke-Dumpbin /headers $file.FullName | Where-Object { $_ -match 'machine \(' } | Select-Object -First 1
+        if ($header -notmatch $machine) { "$($file.Name): $($header.Trim())" }
+    }
+    if ($wrongMachine) {
+        throw "binaries that do not target ${Architecture}:`n  $($wrongMachine -join "`n  ")"
+    }
+
     # The cuBLAS shim implements only the calls ggml makes; a call added by a
     # llama.cpp update must be added to kernels\ before it can ship.
-    if ($Backend -eq 'cuda') {
+    if ($cublasShim) {
         $shim = (Get-ChildItem $bin -Filter 'cublas64_*.dll' | Select-Object -First 1)
         $exported = @{}
         Invoke-Dumpbin /exports $shim.FullName | ForEach-Object {
