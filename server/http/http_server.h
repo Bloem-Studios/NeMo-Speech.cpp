@@ -10,7 +10,14 @@
 
 namespace nemo_speech {
 class EngineRegistry;
+namespace asr {
+struct Result;
+}
 namespace http {
+
+// The /v1/audio/transcriptions body for `result` in `format` (json, verbose_json, text, srt, vtt).
+std::string transcript_response(
+    const asr::Result& result, const std::string& requested_language, const std::string& format);
 
 struct ServerConfig {
     std::string address = "127.0.0.1";

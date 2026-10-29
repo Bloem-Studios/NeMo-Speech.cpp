@@ -294,6 +294,11 @@ pcm16_samples(const std::string& bytes) {
     return output;
 }
 
+#endif
+
+}  // namespace
+
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
 std::string
 transcript_response(
     const asr::Result& result, const std::string& requested_language, const std::string& format) {
@@ -337,6 +342,12 @@ transcript_response(
             item["confidence"] = word.confidence;
             if (word.speaker_tag > 0)
                 item["speaker"] = word.speaker_tag;
+            // Not in OpenAI's shape: a character unit's running text (its punctuation, and any
+            // character folded into it) and its spacing, as the srt and vtt cues use them.
+            if (!word.display.empty() && word.display != word.word)
+                item["display"] = word.display;
+            if (word.joins_previous)
+                item["joins_previous"] = true;
             words.emplace_back(std::move(item));
         }
         root["words"] = std::move(words);
@@ -344,8 +355,6 @@ transcript_response(
     return root.dump();
 }
 #endif
-
-}  // namespace
 
 // Magpie owns one mutable streaming workspace, so synthesis is serialized by the
 // runtime.  This coordinator sits in front of it when preemption is requested:

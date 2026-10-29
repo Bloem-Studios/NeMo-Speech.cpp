@@ -34,6 +34,10 @@ if(TARGET nemo_speech_http_server)
         add_executable(test_chat_api ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_chat_api.cpp)
         target_link_libraries(test_chat_api PRIVATE nemo_speech_http_server)
         add_test(NAME chat_api COMMAND test_chat_api)
+        add_executable(test_transcript_response
+            ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_transcript_response.cpp)
+        target_link_libraries(test_transcript_response PRIVATE nemo_speech_http_server)
+        add_test(NAME transcript_response COMMAND test_transcript_response)
     endif()
 
     add_executable(test_http_errors ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_http_errors.cpp)
