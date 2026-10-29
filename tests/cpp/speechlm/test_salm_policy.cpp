@@ -152,6 +152,8 @@ test_language_retry() {
         "retry uk");
     for (const char* none : {"en", "en-US", "", "und", "xx"})
         expect_eq(retry(none), "<none>", std::string("retry ") + none);
+    // Tamil comes back in English or Latin letters whatever the instruction: no second decode.
+    expect_eq(retry("ta"), "<none>", "retry ta");
     for (const auto& [code, name] : language_names())
         if (const auto prompt = language_retry_prompt(code))
             expect(validate_prompt(*prompt) == *prompt, "retry prompt valid " + std::string(code));

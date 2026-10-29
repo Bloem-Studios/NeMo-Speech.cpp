@@ -278,7 +278,9 @@ language_retry_prompt(std::string_view language) {
         {"Bulgarian", "Cyrillic"},
         {"Korean", "Hangul"}};
     const auto name = language_name(language);
-    if (!name || *name == "English")
+    // Tamil comes back in English or Latin letters whatever the instruction (every chunk of the
+    // T4 trial, before and after a retry), so a second decode only doubles the time.
+    if (!name || *name == "English" || *name == "Tamil")
         return std::nullopt;
     const std::string& n = *name;
     if (guards::latin_script_language(language))

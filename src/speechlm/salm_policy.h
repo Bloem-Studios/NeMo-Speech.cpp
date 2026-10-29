@@ -107,7 +107,7 @@ std::string language_hint(
 // The user turn of a second decode when a served transcription came out in another language than
 // `language` (guards::off_language; not NeMo): an instruction that names the language and, for a
 // language written in another script, asks for that script. nullopt when the language is unusable
-// (language_name) or English.
+// (language_name), English, or Tamil, which a second decode does not bring back.
 std::optional<std::string> language_retry_prompt(std::string_view language);
 // Instruction selection: client instruction (stripped) > translation prompt > override > default
 // prompt; append " <|audio|>" when the locator is missing; hint only a served transcription
