@@ -462,6 +462,7 @@ RecognitionStream::RecognitionStream(
         // Words are tagged when their final is built, which for a stream
         // without endpointing is at finish(). Keep their frames until then.
         diar_->hold_frames_from(0);
+        diar_shift_sec_ = recognizer_->enc_frame_center_offset_ms() / 1000.0;
     }
     if (coordinate_ingress_)
         recognizer_->register_streaming_ingress();
@@ -604,8 +605,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                     // Transducer punctuation can extend a word timestamp into
                     // the next turn. Anchor attribution to the word onset and
                     // average two diar frames to reject single-frame noise.
-                    const int spk =
-                        diar_->speaker_for_word_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
+                    const int spk = word_speaker_(ww.start_time, ww.end_time);
                     ww.speaker_tag = spk >= 0 ? spk + 1 : 0;
                 }
                 alt.words.push_back(std::move(ww));
@@ -656,7 +656,8 @@ void
 RecognitionStream::flush_diar_deficit_(const StreamingUpdate& u) {
     if (!diar_ || u.words.empty())
         return;
-    const double end_sec = u.words.back().end_frame * recognizer_->ms_per_enc_frame() / 1000.0;
+    const double end_sec =
+        diar_time_(u.words.back().end_frame * recognizer_->ms_per_enc_frame() / 1000.0);
     const auto target = static_cast<int64_t>(std::ceil(end_sec / diar_->seconds_per_frame()));
     if (target > diar_->n_frames()) {
         const int64_t before = diar_->n_frames();
@@ -684,7 +685,7 @@ RecognitionStream::next() {
             // This final's words are tagged and later words start at or after
             // its last one.
             const double last_start_sec =
-                u.words.back().start_frame * recognizer_->ms_per_enc_frame() / 1000.0;
+                diar_time_(u.words.back().start_frame * recognizer_->ms_per_enc_frame() / 1000.0);
             diar_->hold_frames_from(
                 static_cast<int64_t>(last_start_sec / diar_->seconds_per_frame()));
         }
@@ -746,10 +747,14 @@ RecognitionStream::refresh_speaker_tags(Result& result) const {
     if (!diar_ || result.alternatives.empty())
         return;
     for (auto& word : result.alternatives.front().words) {
-        const int speaker =
-            diar_->speaker_for_word_time(word.start_time / 1000.0, word.end_time / 1000.0);
+        const int speaker = word_speaker_(word.start_time, word.end_time);
         word.speaker_tag = speaker >= 0 ? speaker + 1 : 0;
     }
+}
+
+int
+RecognitionStream::word_speaker_(int32_t start_ms, int32_t end_ms) const {
+    return diar_->speaker_for_word_time(diar_time_(start_ms / 1000.0), diar_time_(end_ms / 1000.0));
 }
 
 std::unique_ptr<RecognitionStream>
@@ -871,6 +876,11 @@ Recognizer::supported_languages() const {
 double
 Recognizer::ms_per_enc_frame() const {
     return offline_backend_ ? 80.0 : model_->ms_per_enc_frame();
+}
+
+double
+Recognizer::enc_frame_center_offset_ms() const {
+    return offline_backend_ ? 0.0 : model_->enc_frame_center_offset_ms();
 }
 
 }  // namespace nemo_speech::asr

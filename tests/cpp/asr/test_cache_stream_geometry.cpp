@@ -53,6 +53,37 @@ check_shapes() {
         "VAD endpoint did not fire after decoded silence reached the threshold");
 }
 
+// Speaker attribution places encoder frame f at the centre of its receptive
+// field. Derive that field by walking the k=3/stride-2 stages: stage output j
+// reads input [2j - pad_left, 2j - pad_left + 2].
+static void
+check_frame_centers() {
+    for (int sub : {2, 4, 8}) {
+        for (auto context : {ConvContext::Causal, ConvContext::Symmetric}) {
+            EncoderConfig cfg;
+            cfg.subsampling_factor = sub;
+            cfg.conv_context = context;
+            const int pad_left = context == ConvContext::Causal ? 2 : 1;
+            for (int f : {0, 1, 13, 14, 1000}) {
+                int lo = f, hi = f;
+                for (int stage = sub; stage > 1; stage /= 2) {
+                    lo = 2 * lo - pad_left;
+                    hi = 2 * hi - pad_left + 2;
+                }
+                require(
+                    lo + hi == 2 * (f * sub + cfg.frame_center_mel_offset()),
+                    "frame centre offset disagrees with the receptive field");
+                if (context == ConvContext::Causal)
+                    require(hi == f * sub, "causal frame must end at mel f*sub");
+            }
+        }
+    }
+    // Nemotron 8x causal subsampling: frame f spans mel [8f-14, 8f], so word
+    // times (f * 80 ms) sit 70 ms after the centre the diarizer compares with.
+    const auto cfg = make_cache_aware_config(EncoderConfig{}, 13);
+    require(cfg.frame_center_mel_offset() == -7, "Nemotron frame centre must be 7 mel early");
+}
+
 static void
 same_encoder(const std::vector<float>& a, const std::vector<float>& b) {
     require(a.size() == b.size(), "encoder size differs from explicit reference chunk");
@@ -237,6 +268,12 @@ check_model(const std::string& path, int gpu, int right) {
     require(model != nullptr, "expected cache-aware RNNT model");
     const auto enc = make_cache_aware_config(model->encoder_config(), right);
     const auto& fe = model->fe_config();
+    require(
+        std::fabs(
+            recognizer.enc_frame_center_offset_ms() -
+            (1 - enc.subsampling_factor) * recognizer.ms_per_enc_frame() / enc.subsampling_factor) <
+            1e-9,
+        "word attribution must use the causal frame centre");
     const int first_mel = 1 + enc.subsampling_factor * right;
     const int new_mel = enc.subsampling_factor * (1 + right);
     const int overlap = 9;  // Existing runner policy, not inferred from subsampling.
@@ -408,6 +445,7 @@ check_model(const std::string& path, int gpu, int right) {
 int
 main(int argc, char** argv) try {
     check_shapes();
+    check_frame_centers();
     if (argc > 1) {
         int gpu = -1;
         if (argc == 4 && std::string(argv[2]) == "--gpu")
