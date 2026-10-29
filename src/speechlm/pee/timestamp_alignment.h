@@ -152,6 +152,10 @@ struct AlignmentConfig {
     // Refinement cap in CTC frames: 12 encoder frames times the head's upsampling factor.
     int max_word_frames = 12;
     float epsilon = 1.0e-6f;
+    // Not NeMo: a stream with no path inside its speaker's activity is searched again over every
+    // frame without the speaker prior instead of failing. Served transcripts can tag the words of
+    // several voices with one speaker, and NeMo then drops all of them.
+    bool retry_without_speaker = false;
 };
 
 // NeMo's _one_pass_speaker_mapping: greedy token onsets counted per speaker column while it is
@@ -208,6 +212,8 @@ struct AlignmentResult {
     std::vector<std::pair<int, int>> mapping;
     std::vector<float> scores;  // path score per stream; -inf for a failed stream
     std::vector<StreamFailure> failed_streams;
+    // Tags of the streams aligned by AlignmentConfig::retry_without_speaker, in stream order.
+    std::vector<int> relaxed_streams;
     // speaker_word_timestamps after refinement: the aligned streams in stream order, each stream's
     // words by start time.
     std::vector<WordRow> words;

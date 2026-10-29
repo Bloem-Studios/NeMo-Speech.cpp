@@ -218,6 +218,10 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
         if (!raw.timestamp_error.empty())
             std::fprintf(
                 stderr, "[salm] word timestamps unavailable: %s\n", raw.timestamp_error.c_str());
+        // A speaker stream that does not align drops its words without an error; say so too.
+        if (raw.details)
+            for (const auto& warning : raw.details->warnings)
+                std::fprintf(stderr, "[salm] %s\n", warning.c_str());
         auto details = raw.details ? std::make_shared<asr::SpeechLmDetails>(*raw.details)
                                    : std::make_shared<asr::SpeechLmDetails>();
         details->text = policy::response_text(raw.text);

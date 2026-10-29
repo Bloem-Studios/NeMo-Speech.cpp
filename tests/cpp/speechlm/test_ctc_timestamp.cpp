@@ -381,6 +381,39 @@ python_tag(int tag) {
     return tag < 0 ? "None" : std::to_string(tag);
 }
 
+// A golden record's log-probs, speaker probabilities and NeMo's 10 ms labels (runs of active frames
+// per speaker, as activity) as aligner inputs; `inputs` points into the vectors.
+struct RecordInputs {
+    std::vector<float> log_probs, speaker, activity10;
+    ts::AlignmentInputs inputs;
+
+    explicit RecordInputs(const Value& r) {
+        log_probs = floats64(r.at("log_probs"));
+        if (!r.at("speaker_probs").is_null())
+            speaker = floats64(r.at("speaker_probs"));
+        if (!r.at("labels10").is_null()) {
+            const auto& rows = r.at("labels10").array();
+            activity10.assign(size_t(r.at("label_frames").number()) * rows.size(), 0.0f);
+            for (size_t c = 0; c < rows.size(); ++c)
+                for (const auto& run : rows[c].array())
+                    for (int t = int(run.array()[0].number()); t < int(run.array()[1].number());
+                         ++t)
+                        activity10[size_t(t) * rows.size() + c] = 1.0f;
+        }
+        inputs.log_probs = log_probs.data();
+        inputs.frames = int(r.at("frames").number());
+        inputs.speaker_probs = speaker.empty() ? nullptr : speaker.data();
+        inputs.speaker_frames = int(r.at("speaker_frames").number());
+        inputs.speakers = int(r.at("speakers").number());
+        inputs.activity10 = activity10.empty() ? nullptr : activity10.data();
+        inputs.label_frames = int(r.at("label_frames").number());
+        inputs.label_speakers = inputs.speakers;
+        inputs.duration = r.at("duration").number();
+    }
+    RecordInputs(const RecordInputs&) = delete;
+    RecordInputs& operator=(const RecordInputs&) = delete;
+};
+
 using TargetsOf = std::function<ts::AlignmentTargets(const std::string&, int frames)>;
 
 // Every record of an aligner golden: the alignment from NeMo's prepared targets and log-probs, and,
@@ -432,33 +465,11 @@ golden_records(const Value& g, const TargetsOf& targets_of, const char* source) 
             ++targets_checked;
         }
         // Alignment.
-        const auto log_probs = floats64(r.at("log_probs"));
-        const auto speaker = r.at("speaker_probs").is_null() ? std::vector<float>{}
-                                                             : floats64(r.at("speaker_probs"));
-        // NeMo's 10 ms labels (runs of active frames per speaker) as activity.
-        std::vector<float> activity10;
-        if (!r.at("labels10").is_null()) {
-            const auto& rows = r.at("labels10").array();
-            activity10.assign(size_t(r.at("label_frames").number()) * rows.size(), 0.0f);
-            for (size_t c = 0; c < rows.size(); ++c)
-                for (const auto& run : rows[c].array())
-                    for (int t = int(run.array()[0].number()); t < int(run.array()[1].number());
-                         ++t)
-                        activity10[size_t(t) * rows.size() + c] = 1.0f;
-        }
-        ts::AlignmentInputs inputs;
-        inputs.log_probs = log_probs.data();
-        inputs.frames = frames;
-        inputs.speaker_probs = speaker.empty() ? nullptr : speaker.data();
-        inputs.speaker_frames = int(r.at("speaker_frames").number());
-        inputs.speakers = int(r.at("speakers").number());
-        inputs.activity10 = activity10.empty() ? nullptr : activity10.data();
-        inputs.label_frames = int(r.at("label_frames").number());
-        inputs.label_speakers = inputs.speakers;
-        inputs.duration = r.at("duration").number();
+        const RecordInputs in(r);
+        const auto& inputs = in.inputs;
         ts::AlignmentConfig config;
         config.max_word_frames = int(r.at("max_word_frames").number());
-        check(log_probs.size() == size_t(frames) * targets.columns.size(), "log-prob shape");
+        check(in.log_probs.size() == size_t(frames) * targets.columns.size(), "log-prob shape");
         const auto result = ts::align_record(targets, inputs, config);
         const auto& e = r.at("expected");
         check(result.ctc_step == e.at("ctc_step").number(), "ctc step");
@@ -576,6 +587,50 @@ golden_records(const Value& g, const TargetsOf& targets_of, const char* source) 
                    : "");
 }
 
+// AlignmentConfig::retry_without_speaker on the golden records NeMo fails: a stream whose speaker
+// column is silent where its words are spoken aligns over every frame, while a stream whose tokens
+// have no path anywhere still fails, and the default keeps NeMo's failures.
+void
+relaxed_retry_tests(const Value& g) {
+    const auto record = [&](const std::string& name) -> const Value& {
+        for (const auto& r : g.at("records").array())
+            if (r.at("name").string() == name)
+                return r;
+        throw std::runtime_error("no golden record " + name);
+    };
+    const auto align = [&](const Value& r, bool retry) {
+        const RecordInputs in(r);
+        ts::AlignmentConfig config;
+        config.max_word_frames = int(r.at("max_word_frames").number());
+        config.retry_without_speaker = retry;
+        return ts::align_record(record_targets(r), in.inputs, config);
+    };
+    const auto words_of = [](const ts::AlignmentResult& result, int tag) {
+        return std::count_if(result.words.begin(), result.words.end(), [&](const ts::WordRow& w) {
+            return w.tag == tag;
+        });
+    };
+
+    const auto& silent = record("silent-stream");
+    const auto nemo = align(silent, false);
+    require(
+        nemo.failed_streams.size() == 1 && words_of(nemo, 1) == 0, "default keeps NeMo's failure");
+    const auto relaxed = align(silent, true);
+    require(relaxed.failed_streams.empty(), "retry aligns the silent stream");
+    require(words_of(relaxed, 1) == 2, "retry times both words of the silent stream");
+    require(relaxed.relaxed_streams == std::vector<int>{1}, "retry reports the relaxed stream");
+    require(std::isfinite(relaxed.scores[1]), "retry scores the relaxed stream");
+    require(words_of(relaxed, 0) == words_of(nemo, 0), "retry leaves aligned streams alone");
+
+    const auto impossible = align(record("impossible-token"), true);
+    require(
+        impossible.failed_streams.size() == 1 &&
+            impossible.failed_streams[0].reason == "no_legal_path_in_anchor_band" &&
+            impossible.relaxed_streams.empty(),
+        "retry still fails a stream with no path anywhere");
+    std::puts("speaker-band retry (not NeMo): PASS");
+}
+
 void
 transcript_tests() {
     // clean_sot_transcript keeps speaker, event and style tags and drops other special tokens.
@@ -626,6 +681,7 @@ golden_host_tests(const sentencepiece::SentencePieceProcessor* tokenizer) {
         })
                   : TargetsOf(),
         "synthetic records");
+    relaxed_retry_tests(aligner);
 }
 
 // Evidence of host states (frames x dimension()) the way the encoder produces it: the states in a

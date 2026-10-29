@@ -1156,9 +1156,18 @@ align_record(
             prior[t] =
                 config.speaker_logprob_weight * numpy_log(std::max(activity, config.epsilon));
         }
-        const auto searched = banded_ctc_search(
+        auto searched = banded_ctc_search(
             inputs.log_probs, C, stream.labels, positions,
             inputs.speaker_probs ? prior.data() : nullptr, greedy);
+        if (!std::isfinite(searched.score) && config.retry_without_speaker &&
+            inputs.speaker_probs) {
+            positions.resize(frames);
+            for (int t = 0; t < frames; ++t) positions[t] = t;
+            searched =
+                banded_ctc_search(inputs.log_probs, C, stream.labels, positions, nullptr, greedy);
+            if (std::isfinite(searched.score))
+                result.relaxed_streams.push_back(stream.tag);
+        }
         result.scores.push_back(searched.score);
         if (!std::isfinite(searched.score)) {
             result.failed_streams.push_back(

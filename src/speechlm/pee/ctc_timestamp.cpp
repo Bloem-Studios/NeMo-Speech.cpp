@@ -860,6 +860,9 @@ CtcTimestampModel::word_timestamps(
     }
     ts::AlignmentConfig config;
     config.max_word_frames = 12 * upsampling();  // NeMo: 12 encoder frames in CTC frames
+    // Not NeMo: the model can tag every word of a conversation with one speaker, whose activity
+    // then excludes the other voices' words, and NeMo drops the whole stream.
+    config.retry_without_speaker = true;
     for (size_t i = 0; i < n; ++i) {
         auto& p = prepared[i];
         if (!p.ok)
@@ -922,6 +925,10 @@ CtcTimestampModel::word_timestamps(
                     "word timestamps: " + std::to_string(failure.words.size()) + " words of " +
                     ts::speaker_label(failure.tag) + " not aligned (" + failure.reason + ")");
             }
+            for (int tag : result.relaxed_streams)
+                d.warnings.push_back(
+                    "word timestamps: " + ts::speaker_label(tag) +
+                    " aligned without its speaker activity (no_legal_path_in_anchor_band)");
             set_diarization(i, &result.diarization);
         }
         catch (const std::exception& e) {
