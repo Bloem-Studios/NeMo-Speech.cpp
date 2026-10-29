@@ -384,6 +384,39 @@ timestamp_units(const std::vector<TranscriptWord>& words) {
     return out;
 }
 
+std::vector<TranscriptWord>
+fold_units(
+    std::vector<TranscriptWord> units,
+    const std::function<bool(const TranscriptWord&)>& representable) {
+    const auto text_of = [](const TranscriptWord& u) {
+        return u.display.empty() ? u.word : u.display;
+    };
+    std::vector<TranscriptWord> out;
+    std::string leading;  // running text folded before the first kept unit
+    bool leading_joins = false;
+    for (auto& unit : units) {
+        if (!representable(unit)) {
+            const std::string space = unit.joins_previous ? "" : " ";
+            if (!out.empty()) {
+                out.back().display = text_of(out.back()) + space + text_of(unit);
+            } else {
+                if (leading.empty())
+                    leading_joins = unit.joins_previous;
+                leading += (leading.empty() ? "" : space) + text_of(unit);
+            }
+            continue;
+        }
+        if (!leading.empty()) {
+            unit.display = leading + (unit.joins_previous ? "" : " ") + text_of(unit);
+            unit.joins_previous = leading_joins;
+            leading.clear();
+        }
+        unit.index = static_cast<int>(out.size());
+        out.push_back(std::move(unit));
+    }
+    return out;
+}
+
 std::vector<int>
 character_token_ids(
     const sentencepiece::SentencePieceProcessor& tokenizer, const std::string& unit, int blank,
@@ -474,9 +507,24 @@ tokenize_stream(
 AlignmentTargets
 alignment_targets(
     const sentencepiece::SentencePieceProcessor& tokenizer, const std::string& transcript,
-    int blank, int ctc_frames) {
+    int blank, int ctc_frames, bool fold_unrepresentable) {
     AlignmentTargets out;
     out.words = timestamp_units(parse_sot_words(transcript));
+    if (fold_unrepresentable)
+        out.words = fold_units(std::move(out.words), [&](const TranscriptWord& unit) {
+            if (unit.kind == UnitKind::word)
+                return true;
+            try {
+                character_token_ids(tokenizer, unit.word, blank, unit.kind == UnitKind::cluster);
+                return true;
+            }
+            catch (const std::runtime_error& e) {
+                if (std::strncmp(e.what(), "Unrepresentable character", 25) != 0)
+                    throw;
+                out.folded.push_back(unit.word);
+                return false;
+            }
+        });
     for (int w = 0; w < static_cast<int>(out.words.size()); ++w) {
         const int tag = out.words[w].tag;
         auto it = std::find_if(out.streams.begin(), out.streams.end(), [&](const SpeakerStream& s) {

@@ -833,7 +833,11 @@ CtcTimestampModel::word_timestamps(
             ev.head->wait();
             if (!(ev.duration_seconds > 0.0) || !std::isfinite(ev.duration_seconds))
                 throw std::runtime_error("invalid audio duration");
-            p.targets = ts::alignment_targets(impl_->tokenizer, transcript, blank, ev.ctc_frames());
+            // Not NeMo: a character outside the head's vocabulary takes a neighbour's time
+            // instead of rejecting the transcript.
+            p.targets = ts::alignment_targets(
+                impl_->tokenizer, transcript, blank, ev.ctc_frames(),
+                /*fold_unrepresentable=*/true);
             if (!p.targets.streams.empty()) {
                 p.head = heads.size();
                 heads.push_back(ev.head.get());
@@ -929,6 +933,10 @@ CtcTimestampModel::word_timestamps(
                 d.warnings.push_back(
                     "word timestamps: " + ts::speaker_label(tag) +
                     " aligned without its speaker activity (no_legal_path_in_anchor_band)");
+            if (!p.targets.folded.empty())
+                d.warnings.push_back(
+                    "word timestamps: " + std::to_string(p.targets.folded.size()) +
+                    " characters outside the CTC vocabulary timed with a neighbour");
             set_diarization(i, &result.diarization);
         }
         catch (const std::exception& e) {

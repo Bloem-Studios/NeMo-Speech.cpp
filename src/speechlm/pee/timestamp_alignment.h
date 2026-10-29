@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -73,6 +74,13 @@ std::string timestamp_script(const std::vector<TranscriptWord>& words);
 // transcript keeps its words. Units are renumbered and carry their running text in `display`.
 std::vector<TranscriptWord> timestamp_units(const std::vector<TranscriptWord>& words);
 
+// Not NeMo: every unit `representable` rejects joins the running text (`display`) of the previous
+// unit, or of the next one at the start, so one character outside the CTC head's vocabulary takes
+// its neighbour's time instead of rejecting the transcript. Units are renumbered.
+std::vector<TranscriptWord> fold_units(
+    std::vector<TranscriptWord> units,
+    const std::function<bool(const TranscriptWord&)>& representable);
+
 // The CTC head's SentencePiece model from a file (tests; the model reads it from its GGUF).
 // NeMo's SentencePieceTokenizer with legacy=false encodes with the model alone: its special
 // tokens are the model's user-defined pieces, matched atomically.
@@ -103,6 +111,8 @@ struct AlignmentTargets {
     // The CTC classes the alignment reads (vocabulary ids): blank, then every stream token
     // ascending. The streams' labels index this list.
     std::vector<int> columns;
+    // Units fold_unrepresentable folded into a neighbour (not NeMo), in transcript order.
+    std::vector<std::string> folded;
 };
 
 // NeMo's _prepare for one transcript: words (parse_sot_words, timestamp_units), speaker streams,
@@ -110,9 +120,11 @@ struct AlignmentTargets {
 // which must equal the words tokenized one by one; each unit alone with character units) and
 // blank-expanded, the minimum-frames check of every stream against `ctc_frames`, and the compact
 // columns. Throws std::runtime_error with NeMo's messages; NeMo rejects the whole transcript then.
+// With `fold_unrepresentable` (not NeMo) a character unit character_token_ids rejects is folded
+// into a neighbour (fold_units) instead.
 AlignmentTargets alignment_targets(
     const sentencepiece::SentencePieceProcessor& tokenizer, const std::string& transcript,
-    int blank, int ctc_frames);
+    int blank, int ctc_frames, bool fold_unrepresentable = false);
 
 // One frame per token plus one per repeated adjacent token.
 int minimum_frames(const std::vector<int>& labels);

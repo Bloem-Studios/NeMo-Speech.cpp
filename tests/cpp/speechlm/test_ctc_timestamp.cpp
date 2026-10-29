@@ -248,6 +248,56 @@ golden_units(const Value& g) {
     std::printf("alignment units: %zu golden transcripts PASS\n", g.at("cases").array().size());
 }
 
+// fold_units (not NeMo): a unit the head cannot represent joins the running text of its neighbour,
+// so the transcript reads the same with one unit fewer.
+void
+fold_units_tests() {
+    const auto running = [](const std::vector<ts::TranscriptWord>& units) {
+        std::string text;
+        for (const auto& u : units) {
+            if (!text.empty() && !u.joins_previous)
+                text += ' ';
+            text += u.display.empty() ? u.word : u.display;
+        }
+        return text;
+    };
+    const auto renumbered = [](const std::vector<ts::TranscriptWord>& units) {
+        for (size_t k = 0; k < units.size(); ++k)
+            if (units[k].index != int(k))
+                return false;
+        return true;
+    };
+    const std::string scold = "\xE5\x8F\xB1", small = "\xE5\xB0\x8F";  // 叱, 小
+    const auto units = ts::timestamp_units(ts::parse_sot_words(
+        "\xE5\xB0\x8F\xE6\x9E\x97\xE3\x81\x95\xE3\x82\x93\xE3\x81\xAE \xE4\xBB\xA3\xE3\x82\x8F"
+        "\xE3\x82\x8A\xE3\x81\xAB\xE5\x8F\xB1\xE3\x82\x89\xE3\x82\x8C\xE3\x82\x8B\xE3\x80\x82"));
+    require(units.size() == 13, "fold fixture: 13 character units");
+
+    const auto all = ts::fold_units(units, [](const ts::TranscriptWord&) { return true; });
+    require(
+        all.size() == units.size() && running(all) == running(units),
+        "fold keeps a clean transcript");
+
+    const auto middle =
+        ts::fold_units(units, [&](const ts::TranscriptWord& u) { return u.word != scold; });
+    require(middle.size() == units.size() - 1, "fold drops the unrepresentable unit");
+    require(running(middle) == running(units), "fold keeps the running text");
+    require(renumbered(middle), "fold renumbers the units");
+    require(middle[8].display == "\xE3\x81\xAB" + scold, "previous unit carries the folded one");
+
+    const auto start =
+        ts::fold_units(units, [&](const ts::TranscriptWord& u) { return u.word != small; });
+    require(
+        start.size() == units.size() - 1 && running(start) == running(units), "fold at the start");
+    require(
+        start[0].display == small + "\xE6\x9E\x97" && renumbered(start),
+        "next unit carries a leading fold");
+
+    const auto none = ts::fold_units(units, [](const ts::TranscriptWord&) { return false; });
+    require(none.empty(), "nothing representable leaves no units");
+    std::puts("unit folding (not NeMo): PASS");
+}
+
 // The units' speaker streams and CTC targets against NeMo's (_tokenize_words, _build_ctc_target),
 // with the tokenizer the goldens were recorded with.
 void
@@ -663,6 +713,7 @@ golden_host_tests(const sentencepiece::SentencePieceProcessor* tokenizer) {
     const auto units =
         load_json(fixture_path("TIMESTAMP_UNITS_GOLDEN", TIMESTAMP_UNITS_GOLDEN_DEFAULT));
     golden_units(units);
+    fold_units_tests();
     if (tokenizer)
         golden_units_tokenize(
             units,
