@@ -165,6 +165,10 @@ class RecognitionStream {
 
    private:
     Result build_result_(const StreamingUpdate& u, bool is_final) const;
+    // Input pushed so far, in whole milliseconds at the original sample rate.
+    int64_t input_ms_() const;
+    // Frame span -> milliseconds, never past the end of the input.
+    void set_word_time_(Word& word, const WordTiming& timing) const;
     // Extends diarization to cover all words in a final result.
     void flush_diar_deficit_(const StreamingUpdate& u);
 
@@ -174,6 +178,7 @@ class RecognitionStream {
     std::unique_ptr<DiarStream> diar_;
     AsrRequestOptions opts_;
     int input_sample_rate_ = 0;
+    uint64_t input_samples_ = 0;  // pushed so far, at input_sample_rate_
     std::unique_ptr<audio::AudioResampler> resampler_;
     std::vector<float> resampled_audio_;
     bool resampler_flushed_ = false;

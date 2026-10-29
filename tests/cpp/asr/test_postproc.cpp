@@ -197,6 +197,20 @@ main() {
             "remap: exact/abbreviated unit keeps its own span");
     }
     {
+        // End-of-stream words share the last real frame. Ties keep the written
+        // order, although the unit is matched before its number.
+        std::vector<WordTiming> w = {
+            {"and", 5, 7, 1.f}, {"two", 7, 8, 1.f}, {"kilograms", 7, 8, 1.f}};
+        update_word_timings(
+            w,
+            "Token:\t0\tand\t0,3\t0,0\nToken:\t1\ttwo kilograms\t4,17\t1,2\n"
+            "Word:\t0\tand\t0\nWord:\t1\t2\t1\nWord:\t2\tkg\t1\n");
+        check(
+            w.size() == 3 && w[0].word == "and" && w[1].word == "2" && w[2].word == "kg" &&
+                w[1].start_frame == 7 && w[2].start_frame == 7,
+            "remap: equal start frames keep the written order");
+    }
+    {
         // Unparseable alignment is a no-op (timings kept).
         std::vector<WordTiming> w = {{"hello", 0, 5, 1.f}};
         update_word_timings(w, "garbage not links");

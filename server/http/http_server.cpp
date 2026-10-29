@@ -290,7 +290,8 @@ transcript_response(
     if (format == "text")
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
-        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
+        // Truncate: word times never pass the input, and neither may a cue.
+        int audio_ms = std::max(1, static_cast<int>(result.audio_processed * 1000));
         std::vector<subtitle::Word> words;
         words.reserve(alternative.words.size());
         for (const auto& word : alternative.words)

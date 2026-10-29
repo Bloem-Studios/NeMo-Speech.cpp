@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // No arguments: model-independent causal first/steady-state shape checks.
-// Optional: MODEL.gguf [--gpu N] exercises actual streaming, reset and EOF.
+// Optional: MODEL.gguf [--gpu N] exercises actual streaming, reset and EOF,
+// plus word coordinates and end-of-stream word bounds on the repository's JFK sample.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -66,6 +67,162 @@ same_encoder(const std::vector<float>& a, const std::vector<float>& b) {
         std::fprintf(
             stderr, "encoder max abs error=%g RMS=%g\n", largest, std::sqrt(sum / a.size()));
     require(largest <= 1e-5f, "encoder differs from explicit first/history chunk");
+}
+
+static std::vector<float>
+jfk_audio() {
+    std::vector<float> audio;
+    int rate = 0;
+    require(
+        read_wav_mono_16k(NEMO_SPEECH_TEST_FILES_DIR "/asr/wav/test/jfk.wav", audio, rate) &&
+            rate == 16000,
+        "cannot read test_files/asr/wav/test/jfk.wav");
+    return audio;
+}
+
+// Runner words must sit on an independently derived coordinate: decode
+// explicitly assembled chunks with a fresh decoder at absolute frame
+// chunk * (R + 1). Packets match chunk boundaries, as in check_model.
+static void
+check_first_word_frame(const RecognizerConfig& cfg, RnntModel* model, int right) {
+    const auto audio = jfk_audio();
+    const auto enc = make_cache_aware_config(model->encoder_config(), right);
+    const auto& fe = model->fe_config();
+    const int hop = model->fe().hop_length();
+    const int first_mel = 1 + enc.subsampling_factor * right;
+    const int new_mel = enc.subsampling_factor * (1 + right);
+    const int overlap = 9;
+    const size_t first_samples = (first_mel - 1) * hop + fe.n_fft / 2;
+    const size_t stride_samples = new_mel * hop;
+    const int prompt = model->prompt_index_for_lang("auto");
+
+    AsrRequestOptions opts;
+    opts.enable_word_time_offsets = true;
+    CacheStreamRunner runner(model, cfg);
+    runner.set_prompt_index(prompt);
+    runner.set_request_options(opts);
+    auto reference = model->make_transducer_decoder();
+    reference->set_compute_timestamps(true);
+    auto state = model->make_cache_state();
+    std::vector<float> all_mel;
+    int consumed = 0, cached = 0;
+    bool compared = false;
+    for (int chunk = 0; !compared; ++chunk) {
+        const size_t available = first_samples + chunk * stride_samples;
+        require(available <= audio.size(), "no word in the JFK sample");
+        const std::vector<float> prefix(audio.begin(), audio.begin() + available);
+        std::vector<float> fresh_mel;
+        produce_new_mel_frames(
+            model->fe(), prefix, 0, static_cast<int64_t>(all_mel.size() / fe.n_mels), fresh_mel);
+        all_mel.insert(all_mel.end(), fresh_mel.begin(), fresh_mel.end());
+        const int lead = chunk == 0 ? 0 : overlap;
+        const int frames = lead + (chunk == 0 ? first_mel : new_mel);
+        std::vector<float> mel(static_cast<size_t>(frames) * fe.n_mels, 0.0f);
+        for (int f = 0; f < frames; ++f)
+            if (consumed - lead + f >= 0)
+                std::copy_n(
+                    all_mel.data() + static_cast<size_t>(consumed - lead + f) * fe.n_mels,
+                    fe.n_mels, mel.data() + static_cast<size_t>(f) * fe.n_mels);
+        std::vector<float> mask(enc.cache_left_ctx + enc.cache_chunk_frames, 0.0f);
+        std::fill_n(mask.begin(), std::max(0, enc.cache_left_ctx - cached), -1e9f);
+        std::vector<float> projected;
+        int count = 0;
+        model->encode_cache_aware(
+            state, mel.data(), frames, mask.data(), static_cast<int>(mask.size()), projected, count,
+            prompt);
+        require(count == right + 1, "wrong reference encoder frame count");
+        reference->step(
+            projected.data(), model->rnnt_config().joint_dim, count,
+            static_cast<int64_t>(chunk) * (right + 1));
+        consumed += chunk == 0 ? first_mel : new_mel;
+        cached = std::min(enc.cache_left_ctx, cached + count);
+
+        const size_t begin = chunk == 0 ? 0 : first_samples + (chunk - 1) * stride_samples;
+        runner.feed_audio(audio.data() + begin, available - begin);
+        const auto update = runner.step();
+        require(runner.chunks_processed() == chunk + 1, "runner did not consume one chunk");
+        const double decoded_sec = static_cast<double>(enc.cache_decoded_mel_frames(
+                                       static_cast<int64_t>(chunk + 1) * (right + 1))) *
+                                   hop / fe.sample_rate;
+        require(
+            std::fabs(update.audio_processed_sec - decoded_sec) < 1e-6,
+            "audio_processed is not the decoded mel frontier");
+        const auto& expected = reference->word_timings();
+        require(update.words.size() == expected.size(), "runner and reference word counts differ");
+        if (!expected.empty()) {
+            require(
+                update.words.front().word == expected.front().word &&
+                    update.words.front().start_frame == expected.front().start_frame &&
+                    update.words.front().end_frame == expected.front().end_frame,
+                "first word is not at the independently derived emission frame");
+            std::fprintf(
+                stdout, "[PASS] R=%d first word '%s' at encoder frame %lld (chunk %d)\n", right,
+                expected.front().word.c_str(), static_cast<long long>(expected.front().start_frame),
+                chunk);
+            compared = true;
+        }
+    }
+}
+
+// End-of-stream flush words must stay within the audio on every path that
+// reaches the SDK (PR #46 report: 0.64 s of JFK at R13 timed "And" at 1.12 s).
+static void
+check_eof_word_times(const RecognizerConfig& cfg, int right) {
+    const auto full = jfk_audio();
+    const std::vector<float> audio(full.begin(), full.begin() + 10240);  // 0.64 s
+    std::vector<float> audio_8k;                                         // the same audio at 8 kHz
+    const std::vector<float>* inputs[] = {&audio, &audio_8k};
+    for (size_t i = 0; i < audio.size(); i += 2) audio_8k.push_back(audio[i]);
+    Recognizer recognizer(cfg);
+    AsrRequestOptions opts;
+    opts.enable_word_time_offsets = true;
+    auto check_words = [&](const Result& result, int32_t limit_ms, const char* what) {
+        require(!result.alternatives.empty(), what);
+        int32_t previous = 0;
+        for (const auto& word : result.alternatives.front().words) {
+            if (!(word.start_time >= previous && word.start_time < word.end_time &&
+                  word.end_time <= limit_ms)) {
+                std::fprintf(
+                    stderr, "%s: '%s' %d-%d ms, audio %d ms\n", what, word.word.c_str(),
+                    word.start_time, word.end_time, limit_ms);
+                throw std::runtime_error("word time outside the audio");
+            }
+            previous = word.start_time;
+        }
+        return result.alternatives.front().words.size();
+    };
+    size_t streamed_words = 0;
+    for (const auto* input : inputs) {
+        const int rate = input == &audio ? 16000 : 8000;
+        auto stream = recognizer.streaming_recognize(opts, "auto");
+        stream->set_interim_words(true);
+        for (size_t off = 0; off < input->size(); off += rate / 10) {
+            stream->push(
+                input->data() + off, std::min<size_t>(rate / 10, input->size() - off), rate);
+            const int32_t pushed_ms = static_cast<int32_t>(
+                std::min(input->size(), off + rate / 10) * 1000 / static_cast<size_t>(rate));
+            while (auto result = stream->next()) {
+                check_words(*result, pushed_ms, "interim/EOU word");
+                require(result->audio_processed * 1000 <= pushed_ms, "progress past pushed audio");
+                if (!result->is_final)
+                    break;
+            }
+        }
+        const auto final = stream->finish();
+        const size_t words = check_words(final, 640, "end-of-stream word");
+        require(std::fabs(final.audio_processed - 0.64f) < 1e-6f, "final progress is not 0.64 s");
+        if (rate == 16000)
+            streamed_words = words;
+        check_words(
+            recognizer.recognize(input->data(), input->size(), opts, "auto", rate), 640,
+            "offline word");
+    }
+    // The flush must keep the tail word, only its time moves onto real audio.
+    if (right == 13)
+        require(streamed_words > 0, "end-of-stream flush lost the tail word");
+    std::fprintf(
+        stdout, "[PASS] R=%d end-of-stream words within 0.64 s (%zu streamed)\n", right,
+        streamed_words);
 }
 
 static void
@@ -155,6 +312,13 @@ check_model(const std::string& path, int gpu, int right) {
         runner.take_encoder_frames(actual, actual_t, dim);
         require(actual_t == expected_t, "wrong runner encoder frame count");
         require(runner.chunks_processed() == step + 1, "wrong chunk consumption");
+        const auto emitted = static_cast<int64_t>(runner.rnnt_decode_stats().encoder_frames);
+        require(
+            emitted == static_cast<int64_t>(step + 1) * (right + 1),
+            "first/steady transition changed the absolute decoder frame offset");
+        require(
+            enc.cache_decoded_mel_frames(emitted) == consumed + fresh,
+            "decoded frontier differs from independently assembled real Mel coverage");
         same_encoder(actual, expected);
         if (step == 0)
             first_output = actual;
@@ -162,6 +326,9 @@ check_model(const std::string& path, int gpu, int right) {
         cached = std::min(enc.cache_left_ctx, cached + expected_t);
     }
     runner.reset();
+    require(
+        runner.rnnt_decode_stats().encoder_frames == 0,
+        "new stream retained the previous decoder frame clock");
     // Preserve FE packet shapes as well: Metal FFT rounding can differ across
     // packet shapes independently of the encoder's chunk geometry.
     runner.feed_audio(audio.data(), first_samples - 1);
@@ -214,12 +381,18 @@ check_model(const std::string& path, int gpu, int right) {
         require(runner.cache_filled_frames() == right + 1, "EOU changed encoder cache");
         const int before = runner.chunks_processed();
         require(before == 1, "EOU synthesized extra chunks");
+        require(
+            runner.rnnt_decode_stats().encoder_frames == static_cast<uint64_t>(right + 1),
+            "EOU reset the absolute decoder clock after the first chunk");
         runner.feed_audio(audio.data() + first_samples, stride_samples - 1);
         runner.step();
         require(runner.chunks_processed() == before, "post-EOU reused first-chunk geometry");
         runner.feed_audio(audio.data() + first_samples + stride_samples - 1, 1);
         runner.step();
         require(runner.chunks_processed() == before + 1, "post-EOU steady chunk was not processed");
+        require(
+            runner.rnnt_decode_stats().encoder_frames == static_cast<uint64_t>(2 * (right + 1)),
+            "post-EOU decoder clock did not retain the first chunk offset");
         std::vector<float> output;
         int count = 0, dim = 0;
         runner.take_encoder_frames(output, count, dim);
@@ -228,6 +401,8 @@ check_model(const std::string& path, int gpu, int right) {
     const auto no_eou = after_boundary(false);
     same_encoder(no_eou, after_boundary(true));
     std::fprintf(stdout, "[PASS] R=%d first/history encoder, reset, EOF and EOU\n", right);
+    check_first_word_frame(cfg, model, right);
+    check_eof_word_times(cfg, right);
 }
 
 int
