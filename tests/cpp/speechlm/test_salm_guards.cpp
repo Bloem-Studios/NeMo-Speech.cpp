@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-// Decoding guards (salm_guards): unit vectors for the loop and script guards.
+// Decoding guards (salm_guards): unit vectors for the loop, script and language guards.
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -97,6 +97,39 @@ main() {
         "other scripts fail");
     check(!is_latin_script(std::string("\xE0\xA4", 2)), "partial UTF-8 fails");
     check(!is_latin_script("\xEF\xBF\xBD") && !is_latin_script("a\xEF\xBF\xBD"), "U+FFFD fails");
+
+    // language guard (not NeMo): a chunk the model translated into English, or wrote in Latin
+    // letters, instead of the requested language
+    const std::string english =
+        "You waited quite a long time to let us know, didn't you? I thought about calling you a "
+        "few times, but with the time difference that was hard.";
+    const std::string dutch =
+        "En wat zei ze toen? Ze vond het jammer dat we zo laat belden. Jij hebt ook wel heel lang "
+        "gewacht om iets te laten weten. Ik heb een paar keer gedacht om te bellen, maar met het "
+        "tijdsverschil was dat lastig. Morgen gaan we samen naar de markt en daarna eten we bij "
+        "oma.";
+    check(off_language(english, "nl") && off_language(english, "nl-BE"), "English for Dutch");
+    check(!off_language(dutch, "nl"), "Dutch for Dutch");
+    check(!off_language(dutch + " You know what I mean?", "nl"), "an English phrase in Dutch text");
+    check(!off_language(english, "en") && !off_language(english, "en-GB"), "English for English");
+    check(off_language(english, "ja") && off_language(english, "ja_JP"), "English for Japanese");
+    check(
+        !off_language("では、明日の会議は十時に始めます。よろしくお願いします。", "ja"),
+        "Japanese for Japanese");
+    const std::string hindi =
+        "आज हम एक नई film के बारे में बात करेंगे. ये कहानी थोड़ी सी emotional है, लेकिन पूरा परिवार "
+        "साथ में बैठकर देख सकता है.";
+    check(!off_language(hindi, "hi"), "Hindi with English words for Hindi");
+    check(
+        off_language(
+            "Aaj hum ek nayi film ke baare mein baat karenge. Yeh kahani thodi si emotional hai.",
+            "hi"),
+        "romanised Hindi for Hindi");
+    check(
+        !off_language(english, "") && !off_language(english, "und") && !off_language(english, "xx"),
+        "no usable language: no verdict");
+    check(!off_language("Okay, thank you, I know what you mean.", "nl"), "too short for a verdict");
+    check(!off_language("", "ja") && !off_language("1, 2, 3!", "ja"), "no letters: no verdict");
 
     if (failures)
         return 1;

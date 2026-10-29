@@ -78,6 +78,33 @@ constexpr size_t kMinWindow = kShortSpan, kEvery = 4;
 constexpr size_t kReplayNgram = 16, kReplayWindow = 256;
 constexpr double kReplayFraction = 0.9;
 
+// The lowercased primary subtag of a tag of at most two subtags ("en-US", "pt_BR"), else "".
+std::string
+primary_subtag(std::string_view language) {
+    std::string tag(language);
+    for (char& c : tag)
+        c = c == '_' ? '-' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const size_t dash = tag.find('-');
+    if (dash != std::string::npos && tag.find('-', dash + 1) != std::string::npos)
+        return {};  // > 2 subtags
+    return tag.substr(0, dash);
+}
+
+// Language guard: the hint's languages written in another script than Latin, and frequent English
+// words that are not words of the other Latin-script languages (no "is", "have", "for", "will",
+// "her", "my", "to" ...). Dutch, French and German transcripts hold at most 2% of these words over
+// 30 s, English transcripts 11% or more over two minutes.
+constexpr std::array<std::string_view, 14> kOtherScriptLanguages = {
+    "ar", "bg", "bn", "el", "he", "hi", "hy", "ja", "ko", "ru", "ta", "th", "uk", "zh"};
+constexpr std::array<std::string_view, 45> kEnglishWords = {
+    "the",    "and",    "you",   "that",   "this",   "with",      "not",    "but",     "they",
+    "she",    "your",   "what",  "it",     "it's",   "i'm",       "don't",  "can't",   "there",
+    "would",  "about",  "from",  "our",    "his",    "them",      "their",  "because", "could",
+    "should", "know",   "think", "who",    "when",   "where",     "which",  "were",    "going",
+    "yeah",   "didn't", "i'll",  "you're", "that's", "something", "really", "want",    "there's"};
+constexpr size_t kMinWords = 12, kMinLetters = 20;
+constexpr double kEnglishShare = 0.08, kLatinShare = 0.5;
+
 }  // namespace
 
 bool
@@ -85,15 +112,49 @@ latin_script_language(std::string_view language) {
     static const std::array<std::string_view, 29> kLatinLanguages = {
         "en", "fr", "de", "it", "es", "pt", "nl", "pl", "tr", "sv", "da", "fi", "nb", "nn", "no",
         "cs", "hr", "sk", "sl", "et", "lv", "lt", "hu", "ro", "mt", "id", "vi", "tl", "fil"};
-    std::string tag(language);
-    for (char& c : tag)
-        c = c == '_' ? '-' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    const size_t dash = tag.find('-');
-    if (dash != std::string::npos && tag.find('-', dash + 1) != std::string::npos)
-        return false;  // > 2 subtags
-    const std::string primary = tag.substr(0, dash);
+    const std::string primary = primary_subtag(language);
     return !primary.empty() && std::find(kLatinLanguages.begin(), kLatinLanguages.end(), primary) !=
                                    kLatinLanguages.end();
+}
+
+bool
+off_language(std::string_view text, std::string_view language) {
+    const std::string primary = primary_subtag(language);
+    const bool other_script =
+        !primary.empty() &&
+        std::find(kOtherScriptLanguages.begin(), kOtherScriptLanguages.end(), primary) !=
+            kOtherScriptLanguages.end();
+    if (!other_script && (primary == "en" || !latin_script_language(primary)))
+        return false;
+    size_t letters = 0, latin = 0, words = 0, english = 0;
+    std::string word;  // lowercased; a non-ASCII letter keeps it from matching an English word
+    const auto end_word = [&] {
+        if (word.empty())
+            return;
+        ++words;
+        english +=
+            std::find(kEnglishWords.begin(), kEnglishWords.end(), word) != kEnglishWords.end();
+        word.clear();
+    };
+    for (size_t i = 0; i < text.size();) {
+        char32_t cp = 0;
+        if (!next_code_point(text, i, cp)) {
+            ++i;
+            end_word();
+        } else if (in_ranges(std::begin(kLetterMark), std::end(kLetterMark), cp)) {
+            ++letters;
+            latin += in_ranges(std::begin(kLatin), std::end(kLatin), cp);
+            word += cp < 0x80 ? static_cast<char>(std::tolower(static_cast<int>(cp))) : '\x01';
+        } else if ((cp == '\'' || cp == 0x2019) && !word.empty()) {
+            word += '\'';
+        } else {
+            end_word();
+        }
+    }
+    end_word();
+    if (other_script)
+        return letters >= kMinLetters && double(latin) > kLatinShare * double(letters);
+    return words >= kMinWords && double(english) >= kEnglishShare * double(words);
 }
 
 bool

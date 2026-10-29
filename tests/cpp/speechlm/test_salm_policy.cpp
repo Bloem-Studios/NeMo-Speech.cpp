@@ -121,6 +121,42 @@ test_language() {
                 (c.language ? c.language : "<null>") + ")");
 }
 
+// language_retry_prompt (not NeMo): the instruction of the second decode of a transcript that came
+// out in another language.
+void
+test_language_retry() {
+    const auto retry = [](std::string_view language) {
+        const auto got = language_retry_prompt(language);
+        return got ? *got : std::string("<none>");
+    };
+    expect_eq(
+        retry("nl"),
+        "Transcribe this Dutch speech verbatim in Dutch. Write exactly the Dutch words that are "
+        "spoken. Do not translate into English. <|audio|>",
+        "retry nl");
+    expect_eq(
+        retry("ja-JP"),
+        "Transcribe the following Japanese speech verbatim in Japanese, written in Japanese "
+        "script, not English. <|audio|>",
+        "retry ja-JP");
+    // The script by its own name where the language's is not it ("Hindi script" stays romanised).
+    expect_eq(
+        retry("hi"),
+        "Transcribe the following Hindi speech verbatim in Hindi, written in Devanagari script, "
+        "not English. <|audio|>",
+        "retry hi");
+    expect_eq(
+        retry("uk"),
+        "Transcribe the following Ukrainian speech verbatim in Ukrainian, written in Cyrillic "
+        "script, not English. <|audio|>",
+        "retry uk");
+    for (const char* none : {"en", "en-US", "", "und", "xx"})
+        expect_eq(retry(none), "<none>", std::string("retry ") + none);
+    for (const auto& [code, name] : language_names())
+        if (const auto prompt = language_retry_prompt(code))
+            expect(validate_prompt(*prompt) == *prompt, "retry prompt valid " + std::string(code));
+}
+
 void
 test_prompts() {
     for (const auto& c : kValidateCases)
@@ -369,6 +405,7 @@ int
 main(int argc, char** argv) {
     test_tables();
     test_language();
+    test_language_retry();
     test_prompts();
     test_budget();
     test_text_and_usage();

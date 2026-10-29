@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 
+#include "salm_guards.h"
+
 namespace nemo_speech::speechlm::policy {
 
 namespace {
@@ -263,6 +265,32 @@ language_hint(std::string_view prompt, std::optional<std::string_view> language,
     const std::string_view prefix =
         strip_view(prompt.substr(0, prompt.size() - kAudioLocator.size()), false, true);
     return std::string(prefix) + " " + sentence + " " + std::string(kAudioLocator);
+}
+
+std::optional<std::string>
+language_retry_prompt(std::string_view language) {
+    // Wordings that brought a translated or romanised chunk back (Dutch; Japanese and Hindi). A
+    // script goes by its own name where the language's is not it: "Hindi script" stays romanised.
+    static const std::vector<std::pair<std::string_view, std::string_view>> kScripts = {
+        {"Hindi", "Devanagari"},
+        {"Russian", "Cyrillic"},
+        {"Ukrainian", "Cyrillic"},
+        {"Bulgarian", "Cyrillic"},
+        {"Korean", "Hangul"}};
+    const auto name = language_name(language);
+    if (!name || *name == "English")
+        return std::nullopt;
+    const std::string& n = *name;
+    if (guards::latin_script_language(language))
+        return "Transcribe this " + n + " speech verbatim in " + n + ". Write exactly the " + n +
+               " words that are spoken. Do not translate into English. " +
+               std::string(kAudioLocator);
+    std::string script = n;
+    for (const auto& [language_of, script_name] : kScripts)
+        if (n == language_of)
+            script = script_name;
+    return "Transcribe the following " + n + " speech verbatim in " + n + ", written in " + script +
+           " script, not English. " + std::string(kAudioLocator);
 }
 
 PromptPlan

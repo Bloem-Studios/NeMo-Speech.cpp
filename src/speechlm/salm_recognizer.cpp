@@ -197,23 +197,55 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
         // instructions keep their empty result.
         if (!request.timestamps && sl.task == "transcribe" && !plan.from_client)
             request.fallback_prompt = std::string(policy::kFallbackPrompt);
-        auto raw = submit(std::move(request), opts.cancelled);
-        if (raw.cancelled)
-            throw asr::Cancelled("SALM: request cancelled");
-        if (!raw.error.empty()) {
-            if (raw.invalid_request)
-                throw std::invalid_argument("SALM: " + raw.error);
-            throw std::runtime_error("SALM: " + raw.error);
-        }
+        // Language guard (not NeMo): a served transcription that came out in another language
+        // than the one requested (the model translates a whole chunk into English, or writes it in
+        // Latin letters) is decoded once more, from the audio, with an instruction that names the
+        // language; the second transcript is kept unless it is off too, and usage adds up. A
+        // streamed response has shown the first transcript already and keeps it.
+        std::optional<SalmRequest> retry;
+        if (sl.task == "transcribe" && !plan.from_client && !sl.on_text)
+            if (auto prompt = policy::language_retry_prompt(plan.language)) {
+                retry = request;
+                retry->prompt = std::move(*prompt);
+            }
+        const auto decode = [&](SalmRequest r) {
+            auto raw = submit(std::move(r), opts.cancelled);
+            if (raw.cancelled)
+                throw asr::Cancelled("SALM: request cancelled");
+            if (!raw.error.empty()) {
+                if (raw.invalid_request)
+                    throw std::invalid_argument("SALM: " + raw.error);
+                throw std::runtime_error("SALM: " + raw.error);
+            }
+            return raw;
+        };
         std::optional<policy::Usage> usage;
-        if (const auto& first = raw.first_attempt)
-            usage = policy::decode_usage(
-                first->prompt_tokens - first->audio_tokens, first->audio_tokens,
-                first->generated_tokens, first->end_of_turn);
-        policy::add_usage(
-            usage, policy::decode_usage(
-                       raw.prompt_tokens - raw.audio_tokens, raw.audio_tokens, raw.generated_tokens,
-                       raw.end_of_turn));
+        const auto add_decode_usage = [&usage](const SalmResult& raw) {
+            if (const auto& first = raw.first_attempt)
+                policy::add_usage(
+                    usage, policy::decode_usage(
+                               first->prompt_tokens - first->audio_tokens, first->audio_tokens,
+                               first->generated_tokens, first->end_of_turn));
+            policy::add_usage(
+                usage, policy::decode_usage(
+                           raw.prompt_tokens - raw.audio_tokens, raw.audio_tokens,
+                           raw.generated_tokens, raw.end_of_turn));
+        };
+        auto raw = decode(std::move(request));
+        add_decode_usage(raw);
+        if (retry && guards::off_language(policy::response_text(raw.text), plan.language)) {
+            auto again = decode(std::move(*retry));
+            add_decode_usage(again);
+            const bool kept =
+                !guards::off_language(policy::response_text(again.text), plan.language);
+            std::fprintf(
+                stderr, "[salm] language guard: the transcript is not in %s; %s\n",
+                plan.language.c_str(),
+                kept ? "kept a second decode with an instruction that names the language"
+                     : "a second decode that names the language is not either, kept the first");
+            if (kept)
+                raw = std::move(again);
+        }
         // A failed alignment keeps the transcript (status "unavailable", no words).
         if (!raw.timestamp_error.empty())
             std::fprintf(

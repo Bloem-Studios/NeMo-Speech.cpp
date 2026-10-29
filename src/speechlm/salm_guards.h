@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Decoding guards of the SALM engine: the Latin-script token mask and the loop guard that ends
-// runaway output.
+// Decoding guards of the SALM engine: the Latin-script token mask, the loop guard that ends
+// runaway output, and the language guard that finds a transcript in the wrong language.
 #pragma once
 
 #include <cstddef>
@@ -26,6 +26,14 @@ bool script_guard(std::string_view output_language, bool client_instruction);
 // spaces pass); false for invalid or incomplete UTF-8 (a token holding part of a character) and for
 // U+FFFD.
 bool is_latin_script(std::string_view utf8);
+
+// ---- language guard (not NeMo)
+// Whether a transcript of speech in `language` came out in another language, as the model does
+// when it translates a whole chunk despite the language hint: mostly Latin letters for a language
+// written in another script (Japanese as English, romanised Hindi), or English for another
+// Latin-script language (Dutch as English). False when there is no verdict: no supported language,
+// English requested, or too little text.
+bool off_language(std::string_view text, std::string_view language);
 
 // ---- loop guard
 // The smallest period p (1..32) the last tokens repeat with over the window p needs, else 0.
